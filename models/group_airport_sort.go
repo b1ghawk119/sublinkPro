@@ -74,11 +74,11 @@ func GetGroupDetail(groupName string) (*GroupDetailResponse, error) {
 	}
 
 	// 获取已保存的排序配置
-	existingSorts := groupAirportSortCache.GetByIndex("groupName", groupName)
-	sortMap := make(map[int]int) // airportID -> sort
-	for _, s := range existingSorts {
-		sortMap[s.AirportID] = s.Sort
-	}
+	//
+	// 注意：订阅拉取（客户端输出）可能是独立进程/多实例部署，
+	// 仅依赖进程内缓存会导致“保存成功但拉取仍是旧顺序”的不一致问题。
+	// 这里直接查库获取最新排序映射，保证与订阅输出逻辑一致。
+	sortMap := GetGroupAirportSortMap(groupName) // airportID -> sort
 
 	// 构建机场详情列表
 	airports := make([]GroupAirportDetail, 0, len(airportNodeCount))
@@ -192,7 +192,16 @@ func SaveGroupAirportSorts(groupName string, sorts []AirportSortItem) error {
 // GetGroupAirportSortMap 获取分组内机场排序映射，供 GetSub 调用
 // 返回 airportID -> sortWeight
 func GetGroupAirportSortMap(groupName string) map[int]int {
-	entries := groupAirportSortCache.GetByIndex("groupName", groupName)
+	if groupName == "" {
+		return nil
+	}
+
+	// 直接查库确保跨进程/多实例一致性（订阅输出以此为准）
+	var entries []GroupAirportSort
+	if err := database.DB.Where("group_name = ?", groupName).Find(&entries).Error; err != nil {
+		utils.Warn("查询分组 %s 的机场排序失败: %v", groupName, err)
+		return nil
+	}
 	if len(entries) == 0 {
 		return nil
 	}
@@ -220,19 +229,25 @@ func GetAllGroupNames() []string {
 
 // GroupInfo 分组概要信息
 type GroupInfo struct {
-	GroupName    string `json:"groupName"`
-	NodeCount    int    `json:"nodeCount"`
-	AirportCount int    `json:"airportCount"`
-	HasSortConfig bool  `json:"hasSortConfig"`
+	GroupName     string `json:"groupName"`
+	NodeCount     int    `json:"nodeCount"`
+	AirportCount  int    `json:"airportCount"`
+	HasSortConfig bool   `json:"hasSortConfig"`
 }
 
 // GetAllGroupInfos 获取所有分组的概要信息
 func GetAllGroupInfos() []GroupInfo {
 	groupNames := GetAllGroupNames()
 	configuredGroups := make(map[string]bool)
-	all := groupAirportSortCache.GetAll()
-	for _, s := range all {
-		configuredGroups[s.GroupName] = true
+	// 直接查库获取已配置排序的分组，避免多实例下缓存不一致
+	var configured []string
+	if err := database.DB.Model(&GroupAirportSort{}).Distinct("group_name").Pluck("group_name", &configured).Error; err != nil {
+		utils.Warn("查询已配置分组排序列表失败: %v", err)
+	} else {
+		configuredGroups = make(map[string]bool, len(configured))
+		for _, name := range configured {
+			configuredGroups[name] = true
+		}
 	}
 
 	infos := make([]GroupInfo, 0, len(groupNames))
@@ -244,9 +259,9 @@ func GetAllGroupInfos() []GroupInfo {
 		}
 
 		infos = append(infos, GroupInfo{
-			GroupName:    name,
-			NodeCount:    len(groupNodes),
-			AirportCount: len(airportSet),
+			GroupName:     name,
+			NodeCount:     len(groupNodes),
+			AirportCount:  len(airportSet),
 			HasSortConfig: configuredGroups[name],
 		})
 	}
